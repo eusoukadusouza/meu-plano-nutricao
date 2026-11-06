@@ -1,0 +1,129 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Data model:
+    // users/{uid}: private profile (email PII); owner only.
+    // directories/{uid}: display name only; owner writes, admins read.
+    // mealPlans/{uid}: one JSON plan per user; owner reads, admins manage.
+    // dailyLogs/{uid}/entries/{day}: owner-scoped daily state.
+    // measurements/{uid}/entries/{day}: owner-scoped body measurements.
+    // permissions/{uid}: admin-managed role metadata; owner may read own role.
+
+    function isAuthenticated() { return request.auth != null; }
+    function isOwner(uid) { return isAuthenticated() && request.auth.uid == uid; }
+    function isDocOwner() { return isAuthenticated() && request.auth.uid == resource.data.ownerId; }
+    function uidUnchanged() { return request.resource.data.ownerId == request.auth.uid; }
+    function uidNotModified() { return request.resource.data.ownerId == resource.data.ownerId; }
+    function isAdmin() { return isAuthenticated() && request.auth.token.admin == true; }
+    function hasRequiredFields(fields) { return request.resource.data.keys().hasAll(fields); }
+    function hasOnlyAllowedFields(fields) { return request.resource.data.keys().hasOnly(fields); }
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+    function isRecent(value) {
+      return value is timestamp && value > request.time - duration.value(5, 'm') && value <= request.time;
+    }
+    function isEmail(value) {
+      return value is string && value.size() <= 254 &&
+        value.matches('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$');
+    }
+    function isDay(value) {
+      return value is string && value.size() == 10 && value.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+    function isValidUser(data) {
+      return data.keys().hasAll(['ownerId', 'email', 'displayName', 'createdAt']) &&
+        data.keys().hasOnly(['ownerId', 'email', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        isEmail(data.email) && data.email == request.auth.token.email &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.createdAt is timestamp &&
+        (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+    function isValidDirectory(data) {
+      return data.keys().hasAll(['ownerId', 'displayName', 'createdAt']) &&
+        data.keys().hasOnly(['ownerId', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.createdAt is timestamp &&
+        (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+    function isValidPlan(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'version', 'planJson', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'name', 'version', 'planJson', 'updatedAt', 'source']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.version is int && data.version >= 1 && data.version <= 1000 &&
+        data.planJson is string && data.planJson.size() >= 2 && data.planJson.size() <= 100000 &&
+        data.updatedAt is timestamp &&
+        (!('source' in data) || (data.source is string && data.source.size() <= 40));
+    }
+    function isValidLog(data) {
+      return data.keys().hasAll(['ownerId', 'day', 'payloadJson', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'day', 'payloadJson', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        isDay(data.day) && data.payloadJson is string &&
+        data.payloadJson.size() >= 2 && data.payloadJson.size() <= 100000 &&
+        data.updatedAt is timestamp;
+    }
+    function isValidMeasurement(data) {
+      return data.keys().hasAll(['ownerId', 'day', 'weightKg', 'waistCm', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'day', 'weightKg', 'waistCm', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        isDay(data.day) && data.weightKg is number && data.weightKg >= 20 && data.weightKg <= 400 &&
+        (data.waistCm == null || (data.waistCm is number && data.waistCm >= 1 && data.waistCm <= 400)) &&
+        data.updatedAt is timestamp;
+    }
+    function isValidPermission(data) {
+      return data.keys().hasAll(['ownerId', 'role', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'role', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 20 && data.ownerId.size() <= 128 &&
+        data.role in ['member', 'admin'] && data.updatedAt is timestamp;
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && uidUnchanged() && isValidUser(request.resource.data) && isRecent(request.resource.data.createdAt);
+      allow update: if isOwner(uid) && isDocOwner() && uidNotModified() && isValidUser(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'email', 'createdAt']);
+      allow delete: if false;
+    }
+    match /directories/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid) && uidUnchanged() && isValidDirectory(request.resource.data) && isRecent(request.resource.data.createdAt);
+      allow update: if isOwner(uid) && isDocOwner() && uidNotModified() && isValidDirectory(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'createdAt']);
+      allow delete: if false;
+    }
+    match /mealPlans/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isAdmin() && request.resource.data.ownerId == uid && isValidPlan(request.resource.data);
+      allow update: if isAdmin() && resource.data.ownerId == uid && request.resource.data.ownerId == uid &&
+        uidNotModified() && isValidPlan(request.resource.data);
+      allow delete: if isAdmin() && resource.data.ownerId == uid;
+    }
+    match /dailyLogs/{uid}/entries/{entryId} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && uidUnchanged() && request.resource.data.ownerId == uid &&
+        request.resource.data.day == entryId && isValidLog(request.resource.data);
+      allow update: if isOwner(uid) && isDocOwner() && uidNotModified() && request.resource.data.ownerId == uid &&
+        request.resource.data.day == entryId && isValidLog(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'day']);
+      allow delete: if isOwner(uid) && resource.data.ownerId == uid;
+    }
+    match /measurements/{uid}/entries/{entryId} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && uidUnchanged() && request.resource.data.ownerId == uid &&
+        request.resource.data.day == entryId && isValidMeasurement(request.resource.data);
+      allow update: if isOwner(uid) && isDocOwner() && uidNotModified() && request.resource.data.ownerId == uid &&
+        request.resource.data.day == entryId && isValidMeasurement(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'day']);
+      allow delete: if isOwner(uid) && resource.data.ownerId == uid;
+    }
+    match /permissions/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create, update: if isAdmin() && request.resource.data.ownerId == uid && isValidPermission(request.resource.data);
+      allow delete: if isAdmin() && resource.data.ownerId == uid;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
